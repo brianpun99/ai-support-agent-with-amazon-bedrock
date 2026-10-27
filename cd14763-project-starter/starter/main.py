@@ -329,6 +329,7 @@ def calculate_loyalty_discount(
     max_redemption_points = int(order_total * 0.5 * points_per_dollar)
     points_redeemed = min(loyalty_points, max_redemption_points)
     points_redeemed = (points_redeemed // 500) * 500
+    tier_discount_pct = tier_rates.get(tier, 0.0)
     redeemed_value = points_redeemed / points_per_dollar
     tier_discount = tier_rates.get(tier, 0.0)
     subtotal_after_points = order_total - redeemed_value
@@ -336,7 +337,7 @@ def calculate_loyalty_discount(
     total_savings = order_total - final_total
     points_earned = earn_rates.get(product_category, 1) * order_total
     remaining_points = loyalty_points - points_redeemed + points_earned
-    print({{ "points_redeemed": points_redeemed, "tier_discount": tier_discount, "final_total": final_total, "total_savings": total_savings, "points_earned": points_earned, "remaining_points": remaining_points }})
+    print({{ "points_redeemed": points_redeemed, "tier_discount": tier_discount, "tier_discount_pct": tier_discount_pct, "final_total": final_total, "total_savings": total_savings, "points_earned": points_earned, "remaining_points": remaining_points }})
 """
 
     try:
@@ -350,12 +351,14 @@ def calculate_loyalty_discount(
                     return json.dumps(event["result"])
 
     except Exception as e:
+        logger.exception(f"Error occurred while calculating loyalty discount: {e}")
         tier_discount = {"Silver": 0.00, "Gold": 0.10,
                          "Platinum": 0.15}.get(tier, 0.0)
         total_savings = order_total * tier_discount
         return json.dumps({
             "points_redeemed": 0,
             "tier_discount": tier_discount,
+            "tier_discount_pct": tier_discount_pct,
             "final_total": order_total - total_savings,
             "total_savings": total_savings,
             "points_earned": 0,
@@ -418,13 +421,23 @@ async def invoke(payload, context=None):
         with MCPClient(
             lambda: streamable_http_client(GATEWAY_URL)
         ) as gateway_client:
-            gateway_tools = gateway_client.list_tools_sync()
-            tools.extend(gateway_tools)
+            try:
+                gateway_tools = gateway_client.list_tools_sync()
+                tools.extend(gateway_tools)
+
+                logger.info(f"Loaded {len(gateway_tools)} tools from the gateway")
+            except TimeoutError:
+                logger.exception("Gateway tool connection timed out")
+            except ConnectionError:
+                logger.exception("Gateway tool connection failed")
+            except Exception as exc:
+                logger.exception(f"Gateway tool loading failed: {exc}")
+
             agent = Agent(
-                model=model,
-                tools=tools,
-                hooks=[memory_hook],
-                system_prompt=system_prompt,
+            model=model,
+            tools=tools,
+            hooks=[memory_hook],
+            system_prompt=system_prompt,
             )
             response = await agent.invoke_async(user_input)
             return response.message["content"][0]["text"]
