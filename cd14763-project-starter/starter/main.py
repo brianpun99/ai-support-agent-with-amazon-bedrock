@@ -305,6 +305,7 @@ def calculate_loyalty_discount(
     order_total: float,
     product_category: str = "standard",
 ) -> str:
+
     """
     Calculate the loyalty discount for a customer order using the
     AgentCore Code Interpreter. Runs exact arithmetic in a secure sandbox.
@@ -318,52 +319,187 @@ def calculate_loyalty_discount(
     Returns:
         Full discount breakdown and final price
     """
+
     code = f"""
+    import json
+
     loyalty_points = {loyalty_points!r}
     tier = {tier!r}
     order_total = {order_total!r}
     product_category = {product_category!r}
     earn_rates = {{"standard": 1, "device": 2, "fresh": 5}}
     tier_rates = {{"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}}
+    tier_discount_pct = tier_rates.get(tier, 0.0)
     points_per_dollar = 100
     max_redemption_points = int(order_total * 0.5 * points_per_dollar)
     points_redeemed = min(loyalty_points, max_redemption_points)
     points_redeemed = (points_redeemed // 500) * 500
-    tier_discount_pct = tier_rates.get(tier, 0.0)
     redeemed_value = points_redeemed / points_per_dollar
-    tier_discount = tier_rates.get(tier, 0.0)
     subtotal_after_points = order_total - redeemed_value
-    final_total = subtotal_after_points - (subtotal_after_points * tier_discount)
+    tier_discount_amount = subtotal_after_points * tier_discount_pct
+    final_total = subtotal_after_points - tier_discount_amount
     total_savings = order_total - final_total
-    points_earned = earn_rates.get(product_category, 1) * order_total
+    points_earned = int(earn_rates.get(product_category, 1) * final_total)
     remaining_points = loyalty_points - points_redeemed + points_earned
-    print({{ "points_redeemed": points_redeemed, "tier_discount": tier_discount, "tier_discount_pct": tier_discount_pct, "final_total": final_total, "total_savings": total_savings, "points_earned": points_earned, "remaining_points": remaining_points }})
-"""
 
+    result = {{
+    "points_redeemed": int(points_redeemed),
+    "tier_discount_pct": float(tier_discount_pct),
+    "tier_discount_amount": float(round(tier_discount_amount, 2)),
+    "final_total": float(round(final_total, 2)),
+    "total_savings": float(round(total_savings, 2)),
+    "points_earned": int(points_earned),
+    "remaining_points": int(remaining_points),
+}}
+    print(json.dumps(result))
+"""
+    
     try:
-        with code_session(REGION) as session:
+        import os
+
+        # Normalize indentation without changing nested code structure.
+        lines = code.splitlines()
+        first_line = next(
+            (line for line in lines if line.strip()), None
+        )
+
+        if first_line is None:
+            raise ValueError("Generated Python code is empty.")
+
+        base_indent = len(first_line) - len(first_line.lstrip(" "))
+        prefix = " " * base_indent
+
+        code_to_execute = "\n".join(
+            line[base_indent:] if line.startswith(prefix) else line
+            for line in lines
+        )
+
+        # Keep the Code Interpreter region separate from Memory.
+        ci_region = os.getenv("CODE_INTERPRETER_REGION", REGION)
+
+        with code_session(ci_region) as session:
             response = session.invoke(
                 "executeCode",
-                {"code": code, "language": "python", "clearContext": True},
+                {
+                    "code": code_to_execute,
+                    "language": "python",
+                    "clearContext": True,
+                },
             )
+
             for event in response["stream"]:
-                if "result" in event:
-                    return json.dumps(event["result"])
+
+                # Detect AWS event-stream exceptions.
+                for key, value in event.items():
+                    if key.endswith("Exception"):
+                        raise RuntimeError(
+                            f"Code Interpreter stream error: {key}: {value}"
+                        )
+
+                if "result" not in event:
+                    continue
+
+                result = event["result"]
+
+                # Log the raw AWS result for debugging.
+                logger.debug(
+                    "Raw Code Interpreter result: %s",
+                    json.dumps(result, default=str),
+                )
+
+                details = result.get("structuredContent") or {}
+
+                # Detect execution failures.
+                if (
+                    result.get("isError", False)
+                    or details.get("exitCode") not in (None, 0)
+                    or details.get("taskStatus") in ("failed", "canceled")
+                ):
+                    error_message = (
+                        details.get("stderr")
+                        or str(result.get("content", []))
+                    )
+
+                    raise RuntimeError(
+                        f"Code Interpreter execution failed: {error_message}"
+                    )
+
+                # Extract the actual calculator JSON.
+                stdout = details.get("stdout")
+
+                # Alternative: extract text from content blocks.
+                if not stdout:
+                    stdout = "\n".join(
+                        block.get("text", "")
+                        for block in result.get("content", [])
+                        if block.get("type") == "text"
+                    )
+
+                # Skip result events without calculation output.
+                if not stdout or not stdout.strip():
+                    continue
+
+                # Parse and validate the returned JSON.
+                calculation = json.loads(stdout.strip())
+
+                required_keys = {
+                    "points_redeemed",
+                    "tier_discount_pct",
+                    "tier_discount_amount",
+                    "final_total",
+                    "total_savings",
+                    "points_earned",
+                    "remaining_points",
+                }
+
+                if (
+                    not isinstance(calculation, dict)
+                    or not required_keys.issubset(calculation)
+                ):
+                    raise ValueError(
+                        "Code Interpreter returned an invalid "
+                        "loyalty calculation."
+                    )
+
+                # Return ONLY the calculated discount JSON.
+                return json.dumps(calculation)
+
+            raise RuntimeError(
+                "Code Interpreter returned no valid calculation result."
+            )
 
     except Exception as e:
-        logger.exception(f"Error occurred while calculating loyalty discount: {e}")
-        tier_discount = {"Silver": 0.00, "Gold": 0.10,
-                         "Platinum": 0.15}.get(tier, 0.0)
-        total_savings = order_total * tier_discount
-        return json.dumps({
-            "points_redeemed": 0,
-            "tier_discount": tier_discount,
+        logger.exception(
+            "Code Interpreter failed: %s. "
+            "Applying tier-only fallback.",
+            e,
+        )
+
+        # Original fallback calculation logic (unchanged).
+        tier_discount_pct = {
+            "Silver": 0.00,
+            "Gold": 0.10,
+            "Platinum": 0.15,
+        }.get(tier, 0.0)
+
+        total_savings = order_total * tier_discount_pct
+        points_redeemed = 0
+        tier_discount_amount = total_savings
+        final_total = order_total - total_savings
+        points_earned = 0
+        remaining_points = loyalty_points
+
+        result = {
+            "points_redeemed": int(points_redeemed),
             "tier_discount_pct": tier_discount_pct,
-            "final_total": order_total - total_savings,
-            "total_savings": total_savings,
-            "points_earned": 0,
-            "remaining_points": loyalty_points,
-        })
+            "tier_discount_amount": float(round(tier_discount_amount, 2)),
+            "final_total": float(round(final_total, 2)),
+            "total_savings": float(round(total_savings, 2)),
+            "points_earned": int(points_earned),
+            "remaining_points": int(remaining_points),
+        }
+
+        return json.dumps(result)
 
 
 # ── TODO 8 — Agent Entrypoint ─────────────────────────────────────────────────
